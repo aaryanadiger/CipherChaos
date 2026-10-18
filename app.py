@@ -7,9 +7,9 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, ttk
 from structures import FIFOQueue, MessageStore
-from network import Receiver, prepare, deliver, validate_url
+from network import Receiver, prepare, deliver, validate_url, begin_pairing, finish_pairing
 
 ROOT = Path(__file__).resolve().parent
 
@@ -34,11 +34,17 @@ class App(tk.Tk):
         self.table_snapshots = {}
         self.events = queue.Queue()
         self.busy = False
+        self.pairing = False
+        self.pair_cancel = threading.Event()
+        self.pending_session = None
         self.phase = 0
         self.status = tk.StringVar(value='Ready. Add messages to watch the data structures change.')
         self.url = tk.StringVar(value=(self.config or {}).get('url', ''))
         self.view = tk.StringVar(value='Sent')
         self.lookup_id = tk.StringVar()
+        self.pair_status = tk.StringVar(value=(
+            'Saved connection loaded. Messages authenticate automatically.' if self.config else
+            'Pair once, then send messages without further approval.'))
         self.build()
         self.protocol('WM_DELETE_WINDOW', self.close)
         if role in ('demo', 'receiver'):
@@ -60,11 +66,21 @@ class App(tk.Tk):
         ttk.Label(header, text='Mode: ' + self.role.upper()).pack(side='right')
         connection = ttk.LabelFrame(self, text='Connection', padding=8)
         connection.pack(fill='x', padx=12)
-        ttk.Label(connection, text='Receiver URL').pack(side='left')
-        ttk.Entry(connection, textvariable=self.url, width=44).pack(side='left', padx=8)
-        ttk.Button(connection, text='Import config', command=self.import_config).pack(side='left', padx=3)
-        ttk.Button(connection, text='Export receiver config', command=self.export_config).pack(side='left', padx=3)
-        ttk.Label(connection, text=f'Local port {self.port}').pack(side='right')
+        row = ttk.Frame(connection)
+        row.pack(fill='x')
+        ttk.Label(row, text='Receiver URL').pack(side='left')
+        ttk.Entry(row, textvariable=self.url, width=44).pack(side='left', padx=8)
+        self.connect_button = ttk.Button(row, text='Connect / pair', command=self.connect)
+        self.connect_button.pack(side='left', padx=3)
+        self.allow_button = ttk.Button(row, text='Allow pairing (2 min)', command=self.allow_pairing)
+        self.allow_button.pack(side='left', padx=3)
+        pairing_row = ttk.Frame(connection)
+        pairing_row.pack(fill='x', pady=(6, 0))
+        ttk.Label(pairing_row, textvariable=self.pair_status, wraplength=650).pack(side='left', fill='x', expand=True)
+        self.approve_button = ttk.Button(pairing_row, text='Approve matching code', command=self.approve_pair)
+        self.approve_button.pack(side='left', padx=3)
+        self.reject_button = ttk.Button(pairing_row, text='Reject / cancel', command=self.cancel_pair)
+        self.reject_button.pack(side='left', padx=3)
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill='both', expand=True, padx=12, pady=10)
         compose = ttk.Frame(self.tabs, padding=12)
@@ -164,45 +180,72 @@ class App(tk.Tk):
             if local_demo:
                 self.config = dict(self.receiver.config)
                 self.url.set(self.config['url'])
+                self.pair_status.set('Local demo connected automatically. No pairing required.')
+            elif not self.url.get():
+                self.url.set(self.receiver.config['url'])
             self.log(f'Receiver listening on localhost:{self.port}; received messages use their own linked list and hash index.')
         except Exception as exc:
             messagebox.showerror('Receiver could not start', str(exc))
 
-    def import_config(self):
-        if self.busy:
-            return
-        path = filedialog.askopenfilename(filetypes=[('JSON config', '*.json')])
-        if not path:
-            return
-        try:
-            config = json.loads(Path(path).read_text(encoding='utf-8'))
-            if config.get('schema') != 'cipherchaos-dsa-v1':
-                raise ValueError('Import a config exported from this CipherChaos DSA receiver')
-            for key in ('url', 'token', 'secret', 'fingerprint'):
-                if not isinstance(config.get(key), str) or not config[key]:
-                    raise ValueError('Missing configuration field: ' + key)
-            validate_url(config['url'])
-            self.config = config
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            self.config_path.write_text(json.dumps(config), encoding='utf-8')
-            self.url.set(config['url'])
-            self.prepared.clear()
-            self.status.set('Receiver config imported. Ready for real delivery.')
-        except Exception as exc:
-            messagebox.showerror('Invalid configuration', str(exc))
+    def save_connection(self, config):
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.config_path.with_suffix('.tmp')
+        temp.write_text(json.dumps(config, indent=2), encoding='utf-8')
+        temp.replace(self.config_path)
+        self.config = config
 
-    def export_config(self):
-        if not self.receiver:
-            return messagebox.showinfo('Receiver required', 'Launch Receiver.bat to export a receiver configuration.')
+    def connect(self):
+        if self.busy or self.pairing or self.role == 'receiver':
+            return
         try:
-            url = validate_url(self.url.get().strip() or self.receiver.config['url'])
+            url = validate_url(self.url.get().strip())
         except ValueError as exc:
-            return messagebox.showerror('Invalid receiver URL', str(exc))
-        path = filedialog.asksaveasfilename(defaultextension='.json', initialfile='cipherchaos-receiver.json')
-        if path:
-            config = dict(self.receiver.config, url=url)
-            Path(path).write_text(json.dumps(config, indent=2), encoding='utf-8')
-            self.status.set('Config exported. Contains shared credentials; transfer privately to the sender.')
+            return messagebox.showerror('Receiver URL required', str(exc))
+        self.pairing = True
+        self.pair_cancel = threading.Event()
+        cancel = self.pair_cancel
+        self.pair_status.set('Connecting. Receiver must click Allow pairing first.')
+        self.refresh()
+
+        def worker():
+            try:
+                pair = begin_pairing(url)
+                self.events.put(('pair_code', cancel, pair['code']))
+                while not cancel.is_set() and time.time() < pair['expires']:
+                    config = finish_pairing(pair)
+                    if config:
+                        self.events.put(('paired', cancel, config))
+                        return
+                    cancel.wait(1.0)
+                if not cancel.is_set():
+                    raise ValueError('Pairing expired. Allow pairing and connect again.')
+            except Exception as exc:
+                if not cancel.is_set():
+                    self.events.put(('pair_failed', cancel, str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def allow_pairing(self):
+        if self.receiver:
+            self.receiver.allow_pairing()
+            self.pending_session = None
+            self.pair_status.set('Pairing open for 2 minutes. Click Connect on the sender.')
+
+    def approve_pair(self):
+        if self.receiver and self.pending_session:
+            try:
+                self.receiver.approve_pair(self.pending_session)
+                self.pair_status.set('Approved. Sender will save the connection automatically.')
+                self.pending_session = None
+            except ValueError as exc:
+                self.pair_status.set(str(exc))
+
+    def cancel_pair(self):
+        self.pair_cancel.set()
+        self.pairing = False
+        if self.receiver:
+            self.receiver.reject_pair()
+        self.pending_session = None
+        self.pair_status.set('Pairing cancelled. Existing saved connections still work.')
 
     def enqueue(self):
         if self.role == 'receiver':
@@ -224,12 +267,13 @@ class App(tk.Tk):
         self.refresh()
 
     def work(self, action):
-        if self.busy or not self.outgoing.peek():
+        if self.busy or self.pairing or not self.outgoing.peek():
             return
         if not self.config:
-            return messagebox.showinfo('Connection required', 'Import the DSA receiver config first, or launch Demo.bat.')
+            return messagebox.showinfo('Connection required', 'Enter the receiver URL and pair once, or launch Demo.bat.')
         try:
             config = dict(self.config, url=validate_url(self.url.get().strip()))
+            self.save_connection(config)
         except Exception as exc:
             return messagebox.showerror('Connection error', str(exc))
         self.busy = True
@@ -245,7 +289,7 @@ class App(tk.Tk):
                         packet = cached[0]
                     else:
                         binding = {'url': config['url'], 'fingerprint': config['fingerprint']}
-                        if record.get('packet') and record.get('destination') == binding:
+                        if record.get('packet') and record.get('destination', {}).get('fingerprint') == binding['fingerprint']:
                             packet = record['packet']
                             trace = f"Reusing persisted encrypted packet for {record['id']} so retries are idempotent."
                         else:
@@ -264,7 +308,25 @@ class App(tk.Tk):
         try:
             while True:
                 event = self.events.get_nowait()
-                if event[0] == 'prepared':
+                if event[0].startswith('pair_') or event[0] == 'paired':
+                    if event[1] is not self.pair_cancel or event[1].is_set():
+                        continue
+                    if event[0] == 'pair_code':
+                        self.pair_status.set(f'Code: {event[2]}. Compare on receiver, then approve there.')
+                    elif event[0] == 'paired':
+                        try:
+                            self.save_connection(event[2])
+                            self.url.set(self.config['url'])
+                            self.prepared.clear()
+                            self.pair_status.set('Paired and saved. Future messages authenticate automatically.')
+                            self.log('PAIR: receiver approved; credentials saved locally. No per-message approval needed.')
+                        except OSError as exc:
+                            self.pair_status.set('Could not save pairing: ' + str(exc))
+                        self.pairing = False
+                    elif event[0] == 'pair_failed':
+                        self.pair_status.set('Pairing failed: ' + event[2])
+                        self.pairing = False
+                elif event[0] == 'prepared':
                     _, msg_id, packet, config, trace = event
                     self.prepared[msg_id] = (packet, config)
                     self.sent.update(msg_id, status='Prepared', packet=packet,
@@ -289,6 +351,15 @@ class App(tk.Tk):
                     self.log('ERROR: ' + event[1] + '. No dequeue; later messages stay queued.')
         except queue.Empty:
             pass
+        if self.receiver:
+            pending = self.receiver.pending_pair()
+            if pending and pending['status'] == 'pending':
+                self.pending_session = pending['session']
+                seconds = max(0, int(pending['expires'] - time.time()))
+                self.pair_status.set(f"Code: {pending['code']} ({seconds}s). Approve only if it matches the sender screen.")
+            elif self.pending_session:
+                self.pending_session = None
+                self.pair_status.set('Pairing expired or cancelled. Click Allow pairing to try again.')
         self.refresh()
         self.poll_timer = self.after(300, self.poll)
 
@@ -308,8 +379,12 @@ class App(tk.Tk):
             self.write(self.hash_diagram, '\n'.join(lines))
         self.fill_table(self.history_table, values)
         for button in (self.prepare_button, self.deliver_button, self.all_button):
-            button.configure(state='disabled' if self.busy or not pending or self.role == 'receiver' else 'normal')
+            button.configure(state='disabled' if self.busy or self.pairing or not pending or self.role == 'receiver' else 'normal')
         self.add_button.configure(state='disabled' if self.role == 'receiver' else 'normal')
+        self.connect_button.configure(state='disabled' if self.busy or self.pairing or self.role == 'receiver' else 'normal')
+        self.allow_button.configure(state='normal' if self.receiver else 'disabled')
+        self.approve_button.configure(state='normal' if self.pending_session else 'disabled')
+        self.reject_button.configure(state='normal' if self.receiver or self.pairing else 'disabled')
 
     def fill_table(self, widget, values):
         snapshot = [(v['id'], v['text'], v['status'], v['time']) for v in values]
@@ -359,6 +434,7 @@ class App(tk.Tk):
             return
         if self.receiver:
             self.receiver.stop()
+        self.pair_cancel.set()
         self.after_cancel(self.poll_timer)
         self.after_cancel(self.animation_timer)
         self.destroy()

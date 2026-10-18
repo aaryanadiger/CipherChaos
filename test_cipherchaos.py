@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from urllib.error import HTTPError
 from structures import FIFOQueue, MessageStore
-from network import Receiver, prepare, deliver
+from network import Receiver, prepare, deliver, begin_pairing, finish_pairing, fetch, canonical
 
 
 class StructuresTest(unittest.TestCase):
@@ -102,6 +102,85 @@ class DeliveryTest(unittest.TestCase):
             deliver(packet, self.config)
             outgoing.dequeue()
         self.assertEqual([x['id'] for x in self.store.history], [10, 11, 12])
+
+
+class PairingTest(unittest.TestCase):
+    setUp = DeliveryTest.setUp
+    tearDown = DeliveryTest.tearDown
+
+    def test_pair_once_and_send_multiple_messages_after_restart(self):
+        self.receiver.allow_pairing()
+        pair = begin_pairing(self.config['url'])
+        self.assertEqual(pair['code'], self.receiver.pending_pair()['code'])
+        self.assertIsNone(finish_pairing(pair))
+        self.receiver.approve_pair(pair['session'])
+        config = finish_pairing(pair)
+        self.assertNotEqual(config['token'], self.config['token'])
+        self.assertEqual(self.receiver.pending_pair(), None)
+        for msg_id in (101, 102):
+            packet, _ = prepare({'id': msg_id, 'text': f'Message {msg_id}'}, config)
+            self.assertEqual(deliver(packet, config)['status'], 'received')
+        self.receiver.stop()
+        self.receiver = Receiver(self.directory / 'receiver', self.store, port=0)
+        self.receiver.start()
+        config['url'] = self.receiver.config['url']
+        packet, _ = prepare({'id': 103, 'text': 'After restart'}, config)
+        self.assertEqual(deliver(packet, config)['status'], 'received')
+
+    def test_closed_and_expired_pairing(self):
+        with self.assertRaises(HTTPError) as error:
+            begin_pairing(self.config['url'])
+        self.assertEqual(error.exception.code, 403)
+        error.exception.close()
+        self.receiver.allow_pairing()
+        pair = begin_pairing(self.config['url'])
+        self.receiver.pair['expires'] = 0
+        with self.assertRaises(ValueError):
+            self.receiver.approve_pair(pair['session'])
+        with self.assertRaises(HTTPError) as error:
+            finish_pairing(pair)
+        self.assertEqual(error.exception.code, 410)
+        error.exception.close()
+
+    def test_wrong_claim_cannot_get_credentials_and_claim_is_single_use(self):
+        self.receiver.allow_pairing()
+        pair = begin_pairing(self.config['url'])
+        self.receiver.approve_pair(pair['session'])
+        with self.assertRaises(HTTPError) as error:
+            finish_pairing(dict(pair, claim='incorrect'))
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+        self.assertIsNotNone(finish_pairing(pair))
+        with self.assertRaises(HTTPError) as error:
+            finish_pairing(pair)
+        self.assertEqual(error.exception.code, 410)
+        error.exception.close()
+
+    def test_reject_and_pending_request_cannot_be_replaced(self):
+        self.receiver.allow_pairing()
+        pair = begin_pairing(self.config['url'])
+        with self.assertRaises(HTTPError) as error:
+            begin_pairing(self.config['url'])
+        self.assertEqual(error.exception.code, 409)
+        error.exception.close()
+        self.assertEqual(self.receiver.pending_pair()['session'], pair['session'])
+        self.receiver.reject_pair()
+        with self.assertRaises(HTTPError) as error:
+            finish_pairing(pair)
+        self.assertEqual(error.exception.code, 410)
+        error.exception.close()
+
+    def test_attempt_limit(self):
+        self.receiver.allow_pairing()
+        for _ in range(5):
+            with self.assertRaises(HTTPError) as error:
+                fetch(self.config['url'] + '/pair/start', canonical({'client_nonce': 'short'}))
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+        with self.assertRaises(HTTPError) as error:
+            begin_pairing(self.config['url'])
+        self.assertEqual(error.exception.code, 429)
+        error.exception.close()
 
 
 if __name__ == '__main__':

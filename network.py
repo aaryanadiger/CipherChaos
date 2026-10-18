@@ -9,7 +9,7 @@ import secrets
 import threading
 import time
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -55,12 +55,42 @@ def validate_url(url):
     return url.rstrip('/')
 
 
+def pairing_code(session, client_nonce, receiver_fingerprint):
+    digest = hashlib.sha256(canonical([session, client_nonce, receiver_fingerprint])).hexdigest()[:8].upper()
+    return digest[:4] + '-' + digest[4:]
+
+
+def begin_pairing(url):
+    url = validate_url(url)
+    nonce = secrets.token_urlsafe(32)
+    response = fetch(url + '/pair/start', canonical({'client_nonce': nonce}),
+                     {'Content-Type': 'application/json'})
+    code = pairing_code(response['session'], nonce, response['fingerprint'])
+    if not hmac.compare_digest(code, response['code']):
+        raise ValueError('Pairing verification failed')
+    return dict(response, url=url, code=code)
+
+
+def finish_pairing(pair):
+    response = fetch(pair['url'] + '/pair/claim', canonical({'session': pair['session']}),
+        {'Content-Type': 'application/json', 'Authorization': 'Pair ' + pair['claim']})
+    if response['status'] == 'approved':
+        config = response['config']
+        if not hmac.compare_digest(config['fingerprint'], pair['fingerprint']):
+            raise ValueError('Receiver identity changed during pairing')
+        config['url'] = pair['url']
+        return config
+    if response['status'] != 'pending':
+        raise ValueError('Pairing expired or was rejected. Connect again.')
+    return None
+
+
 def prepare(message, config):
     url = validate_url(config['url'])
     public = fetch(url + '/public-key')
     key = serialization.load_pem_public_key(public['pem'].encode())
     if not hmac.compare_digest(fingerprint(key), config['fingerprint']):
-        raise ValueError('Receiver public-key fingerprint does not match imported config')
+        raise ValueError('Receiver public-key fingerprint does not match saved connection')
     samples = [secrets.randbelow(4096) for _ in range(220)]
     sample_bytes = ','.join(map(str, samples)).encode('ascii')
     session_key = hashlib.sha256(sample_bytes).digest()
@@ -112,6 +142,12 @@ class Receiver:
         self.config = json.loads(secret_path.read_text(encoding='utf-8'))
         self.config.update(url=f'http://127.0.0.1:{port}', fingerprint=fingerprint(self.key.public_key()),
                            schema='cipherchaos-dsa-v1')
+        self.clients_path = directory / 'paired_clients.json'
+        self.clients = json.loads(self.clients_path.read_text(encoding='utf-8')) if self.clients_path.exists() else {}
+        self.pair_lock = threading.Lock()
+        self.pair_until = 0
+        self.pair_attempts = 0
+        self.pair = None
         self.nonces = {}
         self.lock = threading.Lock()
         owner = self
@@ -139,11 +175,25 @@ class Receiver:
                     self.reply(404, {'error': 'Unknown endpoint'})
 
             def do_POST(self):
+                if self.path in ('/pair/start', '/pair/claim'):
+                    try:
+                        length = int(self.headers.get('Content-Length', '0'))
+                        if not 0 < length <= 2048:
+                            return self.reply(400, {'error': 'Invalid pairing request'})
+                        self.connection.settimeout(10)
+                        payload = json.loads(self.rfile.read(length))
+                        status, response = owner.pair_request(self.path, payload,
+                            self.headers.get('Authorization', ''))
+                        return self.reply(status, response)
+                    except Exception:
+                        return self.reply(400, {'error': 'Invalid pairing request'})
                 if self.path != '/receive':
                     return self.reply(404, {'error': 'Unknown endpoint'})
                 try:
-                    if not hmac.compare_digest(self.headers.get('Authorization', ''),
-                                               'Bearer ' + owner.config['token']):
+                    authorization = self.headers.get('Authorization', '')
+                    token = authorization[len('Bearer '):] if authorization.startswith('Bearer ') else ''
+                    signing_secret = owner.signing_secret(token)
+                    if not signing_secret:
                         return self.reply(401, {'error': 'Invalid token'})
                     length = int(self.headers.get('Content-Length', '0'))
                     if not 0 < length <= 32768:
@@ -155,7 +205,7 @@ class Receiver:
                     if abs(time.time() - int(stamp)) > 120 or not 16 <= len(nonce) <= 128:
                         raise ValueError('Invalid timestamp or nonce')
                     signed = stamp.encode() + b'\n' + nonce.encode() + b'\n' + body
-                    expected = hmac.new(owner.config['secret'].encode(), signed, hashlib.sha256).hexdigest()
+                    expected = hmac.new(signing_secret.encode(), signed, hashlib.sha256).hexdigest()
                     if not hmac.compare_digest(expected, self.headers.get('X-Signature', '')):
                         return self.reply(401, {'error': 'Invalid signature'})
                     packet = json.loads(body)
@@ -186,6 +236,81 @@ class Receiver:
         self.server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
         self.server.daemon_threads = True
         self.config['url'] = f'http://127.0.0.1:{self.server.server_port}'
+
+    def signing_secret(self, token):
+        if hmac.compare_digest(token, self.config['token']):
+            return self.config['secret']
+        with self.pair_lock:
+            client = self.clients.get(hashlib.sha256(token.encode()).hexdigest())
+            return client['secret'] if client else None
+
+    def allow_pairing(self):
+        with self.pair_lock:
+            self.pair_until = time.time() + 120
+            self.pair_attempts = 0
+            self.pair = None
+
+    def pending_pair(self):
+        with self.pair_lock:
+            if self.pair and time.time() < self.pair['expires']:
+                return {key: self.pair[key] for key in ('session', 'code', 'status', 'expires')}
+            return None
+
+    def approve_pair(self, session):
+        with self.pair_lock:
+            pair = self.pair
+            if not pair or pair['session'] != session or pair['status'] != 'pending' or time.time() >= pair['expires']:
+                raise ValueError('This pairing request is no longer active')
+            token, secret = secrets.token_urlsafe(32), secrets.token_urlsafe(48)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            clients = dict(self.clients)
+            clients[token_hash] = {'secret': secret, 'paired_at': int(time.time())}
+            temp = self.clients_path.with_suffix('.tmp')
+            temp.write_text(json.dumps(clients, indent=2), encoding='utf-8')
+            temp.replace(self.clients_path)
+            self.clients = clients
+            pair['config'] = dict(self.config, token=token, secret=secret)
+            pair['status'] = 'approved'
+            self.pair_until = 0
+
+    def reject_pair(self):
+        with self.pair_lock:
+            self.pair = None
+            self.pair_until = 0
+
+    def pair_request(self, path, payload, authorization):
+        with self.pair_lock:
+            now = time.time()
+            if path == '/pair/start':
+                if now >= self.pair_until:
+                    return 403, {'error': 'Pairing closed. Click Allow pairing on receiver.'}
+                if self.pair_attempts >= 5:
+                    return 429, {'error': 'Pairing attempt limit reached'}
+                if self.pair and now < self.pair['expires']:
+                    return 409, {'error': 'A pairing request is already awaiting approval'}
+                self.pair_attempts += 1
+                nonce = payload.get('client_nonce')
+                if not isinstance(nonce, str) or not 32 <= len(nonce) <= 128:
+                    return 400, {'error': 'Invalid client nonce'}
+                session, claim = secrets.token_urlsafe(24), secrets.token_urlsafe(32)
+                code = pairing_code(session, nonce, self.config['fingerprint'])
+                self.pair = {'session': session, 'claim': claim, 'code': code,
+                             'expires': self.pair_until, 'status': 'pending', 'claims': 0}
+                return 200, {'session': session, 'claim': claim, 'code': code,
+                             'fingerprint': self.config['fingerprint'], 'expires': self.pair_until}
+            pair = self.pair
+            if not pair or now >= pair['expires'] or payload.get('session') != pair['session']:
+                return 410, {'error': 'Pairing expired or rejected'}
+            pair['claims'] += 1
+            if pair['claims'] > 180:
+                return 429, {'error': 'Too many pairing checks'}
+            if not hmac.compare_digest(authorization, 'Pair ' + pair['claim']):
+                return 401, {'error': 'Invalid pairing claim'}
+            if pair['status'] == 'approved':
+                result = {'status': 'approved', 'config': pair.pop('config')}
+                self.pair = None
+                return 200, result
+            return 200, {'status': 'pending'}
 
     def start(self):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()

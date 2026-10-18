@@ -13,6 +13,7 @@ Pendulum movement is animated for demonstration. Key input comes from OS-generat
 - Inspect sample generation, encryption, and delivery operations.
 - Persist history and pending messages across restarts.
 - Retain failed messages for retry and prevent duplicate delivery records.
+- Pair a sender once with a matching code and receiver approval, without transferring configuration files.
 
 ## Data Structures
 
@@ -64,16 +65,19 @@ Install the application on both PCs. Install `cloudflared` on the receiver PC.
    cloudflared tunnel --url http://127.0.0.1:5055
    ```
 
-3. Paste the generated HTTPS URL into the application's Receiver URL field.
-4. Select **Export receiver config** and transfer the JSON privately to the sender.
+3. Share the generated HTTPS URL with the sender. The URL does not contain credentials.
+4. Select **Allow pairing (2 min)** in the receiver app.
 
 **Sender**
 
-1. Run `Sender.bat` and select **Import config**.
-2. Enqueue, prepare, and deliver messages.
-3. Inspect received history on the receiver PC.
+1. Run `Sender.bat`, enter the receiver's HTTPS URL, and select **Connect / pair**.
+2. Compare the code shown on both PCs. On the receiver, select **Approve matching code** only if both codes match.
+3. Wait for the sender to report that the connection is paired and saved.
+4. Enqueue, prepare, and deliver messages. Inspect received history on the receiver PC.
 
-Keep the receiver and tunnel running. Export and import the configuration again if the tunnel URL changes. Both PCs need synchronized clocks for timestamp validation.
+Pairing is required once. Both apps retain the credentials across restarts, and each message authenticates automatically. Each paired sender receives separate credentials. Pairing requests expire after two minutes, require local receiver approval, and have attempt limits. **Reject / cancel** closes pairing without affecting existing saved connections.
+
+Keep the receiver and tunnel running. If the tunnel URL changes, update the sender's Receiver URL field and send normally. The new address is saved when sending; the receiver's pinned key remains the same. Pair again if credentials are deleted, reset, or you connect to a different receiver. Both PCs need synchronized clocks for timestamp validation.
 
 ## Project Structure
 
@@ -94,11 +98,11 @@ requirements.txt      Python dependency
 .\.venv\Scripts\python.exe -m unittest -v test_cipherchaos
 ```
 
-Tests cover FIFO order, collision handling, shared node references, persistence, encryption and decryption, authentication failure, tampering rejection, and idempotent retries.
+Tests cover FIFO order, collision handling, shared node references, persistence, encryption and decryption, authentication failure, tampering rejection, idempotent retries, pairing approval, expiry, rejection, attempt limits, and saved credentials after receiver restart.
 
 ## Storage and Security
 
-Runtime files are stored under `data/`, separated by application role. This includes plaintext history, pending packets, receiver credentials, and the private key. Configuration exports contain shared credentials and should be transferred privately.
+Runtime files are stored under `data/`, separated by application role. This includes plaintext history, pending packets, saved connections, paired sender credentials, and the receiver's private key. These files are excluded from Git. No configuration file needs to be transferred between PCs.
 
 Remote delivery requires HTTPS with certificate validation and a pinned public-key fingerprint. Requests use bearer authentication, HMAC-SHA256 signatures, timestamps, and replay protection. Acknowledgments do not return plaintext.
 
