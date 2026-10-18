@@ -1,8 +1,8 @@
 # CipherChaos
 
-A Python desktop application that demonstrates queues, linked lists, and hash tables through encrypted message delivery. Built with Tkinter, it supports a local demonstration and messaging between two PCs through Cloudflare Tunnel.
+A desktop application with a C data structure engine and a Python interface. It demonstrates queues, linked lists, and hash tables through encrypted message delivery, with a local demo and two-PC messaging through Cloudflare Tunnel.
 
-Version `v1.1.0` provides separate messaging and DSA Lab windows. Version `v1.0.0` preserves the previous interface with pairing and DSA views in one window.
+Version `v1.2.0` moves the data structures into C. Version `v1.1.0` introduced separate messaging and DSA Lab windows. Version `v1.0.0` preserves the original combined interface with pairing.
 
 Pendulum movement is animated for demonstration. Key input comes from OS-generated random samples, so no Arduino or physical connection is required.
 
@@ -27,11 +27,15 @@ Pendulum movement is animated for demonstration. Key input comes from OS-generat
 | Singly linked list | Store history using head, tail, and next pointers | Append: O(1); traversal: O(n) |
 | Hash table | Map message IDs to history nodes using separate chaining | Average lookup: O(1 + load factor); worst case: O(n) |
 
-The hash table uses `message_id % 8` to make collisions visible. Its buckets reference the same nodes used by the history list. JSON provides disk persistence; the structures are rebuilt in memory at startup.
+All three structures are implemented in `native/cc_dsa.c`, using C structs, pointers, dynamic allocation, and explicit cleanup. The hash table uses `message_id % 8` to make collisions visible. Its C collision chains reference the same nodes used by the history list.
+
+C owns the message records, linked nodes, queue front and rear pointers, and bucket array. The queue and history share references to the same C-owned message record. Python calls this library through `ctypes` and handles the GUI, encryption, networking, and JSON persistence. Python bucket lists are display snapshots, not the authoritative hash table. There is no Python DSA fallback.
+
+The complexity figures describe native operations. JSON conversion, disk saves, and rendering add separate overhead. Python rebuilds the C structures from saved JSON on startup. A per-store lock and a native-call lock serialize access; the C API itself is not thread-safe.
 
 ## Setup
 
-Requires Python 3.10 or later with Tkinter. On Windows:
+Requires Python 3.10 or later with Tkinter. The repository includes a compiled Windows x64 C library, so a 64-bit Python installation can run it without a C compiler. On Windows:
 
 ```powershell
 git clone https://github.com/aaryanadiger/CipherChaos.git
@@ -39,6 +43,16 @@ cd CipherChaos
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+### Building the C Engine
+
+To rebuild after editing C sources, install Visual Studio C++ Build Tools with the C++ desktop workload, then run:
+
+```powershell
+.\.venv\Scripts\python.exe build_native.py --force
+```
+
+On Linux or macOS, install a C compiler and run `python3 build_native.py`. On other architectures, a matching C compiler is required. The bridge builds the library if a matching binary is missing or its C source stamp has changed. Close running CipherChaos windows before replacing a loaded DLL.
 
 ## Local Demonstration
 
@@ -88,9 +102,15 @@ Keep the receiver and tunnel running. If the tunnel URL changes, update the send
 
 ```text
 app.py                Messaging windows, separate DSA Lab, pairing
-structures.py         FIFO queue, linked list, hash table, persistence
+structures.py         ctypes bridge, native record views, persistence
+native/cc_dsa.c       C queue, linked list, hash table, memory ownership
+native/cc_dsa.h       C structs' opaque handles and public API
+native/test_dsa.c     Standalone C tests
+native/bin/           Compiled Windows x64 library and source stamp
+build_native.py       C library and standalone test build script
 network.py            Encryption, authentication, client, receiver
 test_cipherchaos.py   Data structure and delivery tests
+test_native.py        C integration, shared records, memory cleanup
 test_gui.py           Messaging, shared state, and pairing GUI tests
 Demo.bat              Local demonstration launcher
 Sender.bat            Sender launcher
@@ -101,10 +121,18 @@ requirements.txt      Python dependency
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v test_cipherchaos
+.\.venv\Scripts\python.exe -m unittest -v test_native test_cipherchaos
 ```
 
 Tests cover FIFO order, collision handling, shared node references, persistence, encryption and decryption, authentication failure, tampering rejection, idempotent retries, pairing approval, expiry, rejection, attempt limits, and saved credentials after receiver restart.
+
+To compile and run the standalone C assertions with a C compiler:
+
+```powershell
+.\.venv\Scripts\python.exe build_native.py --test
+```
+
+These exercise FIFO order, C linked traversal, hash collisions, shared record updates, and allocation cleanup without Python or the GUI running the data structure operations.
 
 Run the GUI integration checks on a desktop with Tkinter:
 

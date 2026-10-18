@@ -24,7 +24,7 @@ class App(tk.Tk):
         self.sent = MessageStore(data_dir / 'sent.json')
         self.received = MessageStore(data_dir / 'received.json')
         self.outgoing = FIFOQueue()
-        for record in self.sent.snapshot():
+        for record in self.sent.history:
             if record['status'] != 'Delivered':
                 self.outgoing.enqueue(record)
         self.config_path = data_dir / 'connection.json'
@@ -114,7 +114,7 @@ class App(tk.Tk):
         self.lab_window.protocol('WM_DELETE_WINDOW', self.lab_window.withdraw)
         self.lab_window.withdraw()
         ttk.Label(self.lab_window, text='DSA Lab', font=('Segoe UI', 20, 'bold'), padding=12).pack(anchor='w')
-        ttk.Label(self.lab_window, text='Inspect the same messages used by the messaging window.', padding=(12, 0)).pack(anchor='w')
+        ttk.Label(self.lab_window, text='C engine: FIFO queue, linked-list history, and hash table. Python displays their live state.', padding=(12, 0)).pack(anchor='w')
         self.tabs = ttk.Notebook(self.lab_window)
         self.tabs.pack(fill='both', expand=True, padx=12, pady=10)
         compose = ttk.Frame(self.tabs, padding=12)
@@ -346,7 +346,7 @@ class App(tk.Tk):
         # Time-based integer is readable and remains distinct across sender restarts.
         msg_id = max(time.time_ns() // 1000000, max((x['id'] for x in self.sent.snapshot()), default=0) + 1)
         value = {'id': msg_id, 'text': text, 'status': 'Queued', 'time': time.strftime('%H:%M:%S')}
-        self.sent.add(value)
+        value = self.sent.add(value)
         self.outgoing.enqueue(value)
         source.delete('1.0', 'end')
         self.log(f'ENQUEUE {msg_id}: rear linked to new node, size={self.outgoing.size}. O(1)\n'

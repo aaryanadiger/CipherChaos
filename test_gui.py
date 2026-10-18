@@ -106,6 +106,26 @@ class MessagingWindowTest(unittest.TestCase):
         self.assertEqual(sender.lab_window.state(), 'withdrawn')
         self.assertEqual(receiver.lab_window.state(), 'withdrawn')
 
+    def test_pending_native_queue_reloads_and_shares_history_after_restart(self):
+        app = self.app('demo', 'restart')
+        app.config['token'] = 'incorrect'
+        app.message.insert('1.0', 'Survives native restart')
+        app.send_button.invoke()
+        self.until(lambda: not app.busy)
+        self.assertEqual(app.outgoing.size, 1)
+        app.close()
+        self.apps.remove(app)
+        del app
+        gc.collect()
+        app = self.app('demo', 'restart')
+        record = app.outgoing.peek()
+        history_record, _ = app.sent.index.lookup(record['id'])
+        self.assertEqual(record.native_address, history_record.native_address)
+        app.retry_button.invoke()
+        self.until(lambda: not app.busy)
+        self.assertEqual(app.outgoing.size, 0)
+        self.assertEqual(app.received.snapshot()[0]['text'], 'Survives native restart')
+
 
 if __name__ == '__main__':
     unittest.main()
