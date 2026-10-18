@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 from urllib.request import Request
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -39,8 +40,12 @@ def fetch(url, body=None, headers=None):
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=12) as response:
-        return json.load(response)
+    try:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=12) as response:
+            return json.load(response)
+    except HTTPError as error:
+        error.close()
+        raise
 
 
 def validate_url(url):

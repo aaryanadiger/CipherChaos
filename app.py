@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parent
 class App(tk.Tk):
     def __init__(self, role, data_dir, port):
         super().__init__()
-        self.title('CipherChaos | Secure Messaging & DSA Lab')
-        self.geometry('1180x820')
-        self.minsize(960, 700)
+        self.title('CipherChaos | ' + ('Receiver' if role == 'receiver' else 'Sender'))
+        self.geometry('940x740')
+        self.minsize(880, 650)
         self.role, self.data_dir, self.port = role, data_dir, port
         self.sent = MessageStore(data_dir / 'sent.json')
         self.received = MessageStore(data_dir / 'received.json')
@@ -38,7 +38,11 @@ class App(tk.Tk):
         self.pair_cancel = threading.Event()
         self.pending_session = None
         self.phase = 0
+        self.chat_snapshot = None
+        self.inbox_window = None
+        self.inbox_snapshot = None
         self.status = tk.StringVar(value='Ready. Add messages to watch the data structures change.')
+        self.chat_status = tk.StringVar(value='Waiting for messages.' if role == 'receiver' else 'Ready to send.')
         self.url = tk.StringVar(value=(self.config or {}).get('url', ''))
         self.view = tk.StringVar(value='Sent')
         self.lookup_id = tk.StringVar()
@@ -61,9 +65,11 @@ class App(tk.Tk):
         header = ttk.Frame(self, padding=12)
         header.pack(fill='x')
         ttk.Label(header, text='CipherChaos', font=('Segoe UI', 23, 'bold')).pack(side='left')
-        ttk.Label(header, text='  Secure messaging • Queue • Linked list • Hash table',
+        ttk.Label(header, text='Receiver inbox' if self.role == 'receiver' else 'Secure messaging',
                   font=('Segoe UI', 11)).pack(side='left', padx=10)
-        ttk.Label(header, text='Mode: ' + self.role.upper()).pack(side='right')
+        ttk.Button(header, text='Open DSA Lab', command=self.open_lab).pack(side='right')
+        if self.role == 'demo':
+            ttk.Button(header, text='Open receiver inbox', command=self.open_inbox).pack(side='right', padx=6)
         connection = ttk.LabelFrame(self, text='Connection', padding=8)
         connection.pack(fill='x', padx=12)
         row = ttk.Frame(connection)
@@ -71,17 +77,45 @@ class App(tk.Tk):
         ttk.Label(row, text='Receiver URL').pack(side='left')
         ttk.Entry(row, textvariable=self.url, width=44).pack(side='left', padx=8)
         self.connect_button = ttk.Button(row, text='Connect / pair', command=self.connect)
-        self.connect_button.pack(side='left', padx=3)
+        if self.role != 'receiver':
+            self.connect_button.pack(side='left', padx=3)
         self.allow_button = ttk.Button(row, text='Allow pairing (2 min)', command=self.allow_pairing)
-        self.allow_button.pack(side='left', padx=3)
+        if self.role != 'sender':
+            self.allow_button.pack(side='left', padx=3)
         pairing_row = ttk.Frame(connection)
         pairing_row.pack(fill='x', pady=(6, 0))
-        ttk.Label(pairing_row, textvariable=self.pair_status, wraplength=650).pack(side='left', fill='x', expand=True)
+        ttk.Label(pairing_row, textvariable=self.pair_status, wraplength=520).pack(side='left', fill='x', expand=True)
         self.approve_button = ttk.Button(pairing_row, text='Approve matching code', command=self.approve_pair)
-        self.approve_button.pack(side='left', padx=3)
+        if self.role != 'sender':
+            self.approve_button.pack(side='left', padx=3)
         self.reject_button = ttk.Button(pairing_row, text='Reject / cancel', command=self.cancel_pair)
         self.reject_button.pack(side='left', padx=3)
-        self.tabs = ttk.Notebook(self)
+        conversation = ttk.LabelFrame(self, text='Received messages' if self.role == 'receiver' else 'Your messages', padding=10)
+        conversation.pack(fill='both', expand=True, padx=12, pady=10)
+        self.chat = scrolledtext.ScrolledText(conversation, height=10, wrap='word', font=('Segoe UI', 12),
+            state='disabled', background='#f5f7fa', relief='flat', padx=14, pady=12)
+        self.chat.pack(fill='both', expand=True)
+        self.chat.tag_configure('meta', foreground='#627080', font=('Segoe UI', 10))
+        self.chat.tag_configure('body', spacing1=5, spacing3=16)
+        composer = ttk.Frame(self, padding=(12, 0, 12, 8))
+        composer.pack(fill='x')
+        self.message = scrolledtext.ScrolledText(composer, width=40, height=3, wrap='word', font=('Segoe UI', 12))
+        self.send_button = ttk.Button(composer, text='Send message', command=self.send_message)
+        self.retry_button = ttk.Button(composer, text='Retry pending', command=lambda: self.work('all'))
+        if self.role != 'receiver':
+            self.message.pack(side='left', fill='x', expand=True)
+            self.send_button.pack(side='left', padx=(10, 0))
+            self.retry_button.pack(side='left', padx=(6, 0))
+        ttk.Label(self, textvariable=self.chat_status, padding=10, wraplength=850).pack(fill='x')
+        self.lab_window = tk.Toplevel(self)
+        self.lab_window.title('CipherChaos | DSA Lab')
+        self.lab_window.geometry('1180x820')
+        self.lab_window.minsize(960, 700)
+        self.lab_window.protocol('WM_DELETE_WINDOW', self.lab_window.withdraw)
+        self.lab_window.withdraw()
+        ttk.Label(self.lab_window, text='DSA Lab', font=('Segoe UI', 20, 'bold'), padding=12).pack(anchor='w')
+        ttk.Label(self.lab_window, text='Inspect the same messages used by the messaging window.', padding=(12, 0)).pack(anchor='w')
+        self.tabs = ttk.Notebook(self.lab_window)
         self.tabs.pack(fill='both', expand=True, padx=12, pady=10)
         compose = ttk.Frame(self.tabs, padding=12)
         self.tabs.add(compose, text='1  Compose & FIFO queue')
@@ -92,12 +126,12 @@ class App(tk.Tk):
         message_frame = ttk.Frame(top)
         message_frame.pack(side='left', fill='both', expand=True)
         ttk.Label(message_frame, text='Message to deliver', font=('Segoe UI', 12, 'bold')).pack(anchor='w')
-        self.message = scrolledtext.ScrolledText(message_frame, height=4, wrap='word', font=('Segoe UI', 12))
-        self.message.pack(fill='x', pady=6)
+        self.lab_message = scrolledtext.ScrolledText(message_frame, height=4, wrap='word', font=('Segoe UI', 12))
+        self.lab_message.pack(fill='x', pady=6)
         ttk.Label(message_frame, text='Pendulum: visual demonstration only. Input uses fresh OS-random samples.').pack(anchor='w')
         buttons = ttk.Frame(compose)
         buttons.pack(fill='x', pady=12)
-        self.add_button = ttk.Button(buttons, text='① Enqueue message', command=self.enqueue)
+        self.add_button = ttk.Button(buttons, text='① Enqueue message', command=lambda: self.enqueue(self.lab_message))
         self.add_button.pack(side='left', padx=3)
         self.prepare_button = ttk.Button(buttons, text='② Prepare front (encrypt)', command=lambda: self.work('prepare'))
         self.prepare_button.pack(side='left', padx=3)
@@ -132,10 +166,63 @@ class App(tk.Tk):
         self.trace = self.text_box(pipeline, height=13)
         ttk.Label(pipeline, text='Live DSA operations', font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=5)
         self.operations = self.text_box(pipeline, height=9)
-        ttk.Label(self, textvariable=self.status, padding=10, wraplength=1100).pack(fill='x')
+        ttk.Label(self.lab_window, textvariable=self.status, padding=10, wraplength=1100).pack(fill='x')
         if self.role == 'receiver':
             self.view.set('Received')
             self.tabs.select(1)
+
+    def open_lab(self):
+        self.lab_window.deiconify()
+        self.lab_window.lift()
+
+    def open_inbox(self):
+        if self.inbox_window and self.inbox_window.winfo_exists():
+            self.inbox_window.deiconify()
+            self.inbox_window.lift()
+            return
+        self.inbox_window = tk.Toplevel(self)
+        self.inbox_window.title('CipherChaos | Local receiver inbox')
+        self.inbox_window.geometry('600x560')
+        ttk.Label(self.inbox_window, text='Receiver inbox', font=('Segoe UI', 20, 'bold'), padding=12).pack(anchor='w')
+        ttk.Label(self.inbox_window, text='Messages decrypted by the local demo receiver.', padding=(12, 0)).pack(anchor='w')
+        self.inbox_text = scrolledtext.ScrolledText(self.inbox_window, wrap='word', font=('Segoe UI', 12), state='disabled', padx=12, pady=12)
+        self.inbox_text.pack(fill='both', expand=True, padx=12, pady=12)
+        self.inbox_snapshot = None
+        self.refresh_chat()
+
+    def refresh_chat(self):
+        store = self.received if self.role == 'receiver' else self.sent
+        values = store.snapshot()
+        snapshot = (self.busy, tuple((v['id'], v['text'], v['status'], v['time']) for v in values))
+        if snapshot != self.chat_snapshot:
+            self.chat_snapshot = snapshot
+            self.chat.configure(state='normal')
+            self.chat.delete('1.0', 'end')
+            if not values:
+                self.chat.insert('end', 'Messages will appear here.\n', 'meta')
+            for value in values:
+                status = ('Sending' if self.busy else 'Ready to send') if value['status'] == 'Prepared' else value['status']
+                self.chat.insert('end', f"{value['time']}  |  {status}\n", 'meta')
+                self.chat.insert('end', value['text'] + '\n\n', 'body')
+            self.chat.configure(state='disabled')
+            self.chat.see('end')
+        if self.role == 'receiver':
+            self.chat_status.set(f'{len(values)} message(s) received.' if values else 'Waiting for messages.')
+        if self.inbox_window and self.inbox_window.winfo_exists():
+            records = self.received.snapshot()
+            snapshot = [(v['id'], v['text']) for v in records]
+            if snapshot != self.inbox_snapshot:
+                self.inbox_snapshot = snapshot
+                text = '\n\n'.join(f"{v['time']}  |  Received\n{v['text']}" for v in records)
+                self.write(self.inbox_text, text or 'Waiting for messages.')
+
+    def send_message(self):
+        if self.busy or self.pairing or not self.message.get('1.0', 'end').strip():
+            return
+        if not self.config:
+            return messagebox.showinfo('Pair first', 'Enter the receiver URL and click Connect / pair before sending.')
+        if self.enqueue(self.message):
+            self.work('all')
 
     def selector(self, parent):
         row = ttk.Frame(parent)
@@ -247,10 +334,11 @@ class App(tk.Tk):
         self.pending_session = None
         self.pair_status.set('Pairing cancelled. Existing saved connections still work.')
 
-    def enqueue(self):
+    def enqueue(self, source=None):
         if self.role == 'receiver':
             return messagebox.showinfo('Receiver mode', 'Use Sender.bat or Demo.bat to compose messages.')
-        text = self.message.get('1.0', 'end').strip()
+        source = source if source is not None else self.message
+        text = source.get('1.0', 'end').strip()
         if not text:
             return
         if len(text.encode('utf-8')) > 16000:
@@ -260,11 +348,12 @@ class App(tk.Tk):
         value = {'id': msg_id, 'text': text, 'status': 'Queued', 'time': time.strftime('%H:%M:%S')}
         self.sent.add(value)
         self.outgoing.enqueue(value)
-        self.message.delete('1.0', 'end')
+        source.delete('1.0', 'end')
         self.log(f'ENQUEUE {msg_id}: rear linked to new node, size={self.outgoing.size}. O(1)\n'
                  f'History: append node at tail O(1). Hash index: insert reference in bucket {msg_id % 8}.')
         self.status.set('Queued. Prepare front to inspect encryption, then deliver it.')
         self.refresh()
+        return msg_id
 
     def work(self, action):
         if self.busy or self.pairing or not self.outgoing.peek():
@@ -277,6 +366,7 @@ class App(tk.Tk):
         except Exception as exc:
             return messagebox.showerror('Connection error', str(exc))
         self.busy = True
+        self.chat_status.set('Sending messages...' if action != 'prepare' else 'Preparing message...')
         self.refresh()
         batch = [dict(x) for x in self.outgoing] if action == 'all' else [dict(self.outgoing.peek())]
         self.status.set('Working… receiver acknowledgment is required before dequeue.')
@@ -345,9 +435,11 @@ class App(tk.Tk):
                 elif event[0] == 'done':
                     self.busy = False
                     self.status.set('Operation complete. Inspect history, hash buckets, or the encryption trace.')
+                    self.chat_status.set('Message delivery complete.' if not self.outgoing.peek() else 'Message ready. Pending messages are waiting to be sent.')
                 elif event[0] == 'failed':
                     self.busy = False
                     self.status.set('Delivery stopped: ' + event[1] + '. Front retained for retry.')
+                    self.chat_status.set('Could not deliver. Check the receiver connection, then click Retry pending.')
                     self.log('ERROR: ' + event[1] + '. No dequeue; later messages stay queued.')
         except queue.Empty:
             pass
@@ -364,6 +456,7 @@ class App(tk.Tk):
         self.poll_timer = self.after(300, self.poll)
 
     def refresh(self):
+        self.refresh_chat()
         pending = list(self.outgoing)
         self.write(self.queue_diagram, 'FRONT → ' + ' → '.join(f"[{x['id']} | {x['status']}]" for x in pending) +
                    (' ← REAR' if pending else 'empty (front = rear = None)') + f'\nsize = {len(pending)}')
@@ -385,6 +478,8 @@ class App(tk.Tk):
         self.allow_button.configure(state='normal' if self.receiver else 'disabled')
         self.approve_button.configure(state='normal' if self.pending_session else 'disabled')
         self.reject_button.configure(state='normal' if self.receiver or self.pairing else 'disabled')
+        self.send_button.configure(state='normal' if not self.busy and not self.pairing and self.config else 'disabled')
+        self.retry_button.configure(state='normal' if pending and not self.busy and not self.pairing and self.config else 'disabled')
 
     def fill_table(self, widget, values):
         snapshot = [(v['id'], v['text'], v['status'], v['time']) for v in values]

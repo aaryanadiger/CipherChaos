@@ -2,6 +2,8 @@
 
 A Python desktop application that demonstrates queues, linked lists, and hash tables through encrypted message delivery. Built with Tkinter, it supports a local demonstration and messaging between two PCs through Cloudflare Tunnel.
 
+Version `v1.1.0` provides separate messaging and DSA Lab windows. Version `v1.0.0` preserves the previous interface with pairing and DSA views in one window.
+
 Pendulum movement is animated for demonstration. Key input comes from OS-generated random samples, so no Arduino or physical connection is required.
 
 ## Features
@@ -14,6 +16,8 @@ Pendulum movement is animated for demonstration. Key input comes from OS-generat
 - Persist history and pending messages across restarts.
 - Retain failed messages for retry and prevent duplicate delivery records.
 - Pair a sender once with a matching code and receiver approval, without transferring configuration files.
+- Send and read messages in a clean interface, with pairing controls in the same window.
+- Open the DSA Lab separately to inspect live data structures and encryption activity.
 
 ## Data Structures
 
@@ -44,11 +48,11 @@ Run `Demo.bat`, or:
 .\.venv\Scripts\python.exe app.py --role demo
 ```
 
-1. Compose several messages and select **Enqueue message**.
-2. Inspect the FIFO queue, linked-list history, and hash buckets.
-3. Select **Prepare front (encrypt)** to inspect the encryption process.
-4. Select **Deliver front** or **Send entire queue**.
-5. Switch history to **Received** to view the decrypted messages.
+1. Type a message in the sender window and select **Send message**. Encryption and delivery run automatically.
+2. Select **Open receiver inbox** to see the decrypted messages in a separate window.
+3. Select **Open DSA Lab** when you want to inspect the processing behind those messages.
+
+For a step-by-step DSA presentation, use the Lab's composer to enqueue several messages, inspect the queue and history, select **Prepare front (encrypt)**, then **Deliver front** or **Send entire queue**. The Lab and messaging window use the same queue and history. Closing the Lab hides it and leaves messaging running.
 
 The demo starts a real receiver on `127.0.0.1:5055`. Messages leave the queue only after receiver acknowledgment. Enqueue at least nine messages to guarantee a collision in the eight hash buckets.
 
@@ -73,7 +77,8 @@ Install the application on both PCs. Install `cloudflared` on the receiver PC.
 1. Run `Sender.bat`, enter the receiver's HTTPS URL, and select **Connect / pair**.
 2. Compare the code shown on both PCs. On the receiver, select **Approve matching code** only if both codes match.
 3. Wait for the sender to report that the connection is paired and saved.
-4. Enqueue, prepare, and deliver messages. Inspect received history on the receiver PC.
+4. Type a message and select **Send message**. The receiver sees the decrypted text and timestamp in its inbox.
+5. Use **Retry pending** if delivery fails. Open **DSA Lab** on either PC only when you want to inspect its data structures.
 
 Pairing is required once. Both apps retain the credentials across restarts, and each message authenticates automatically. Each paired sender receives separate credentials. Pairing requests expire after two minutes, require local receiver approval, and have attempt limits. **Reject / cancel** closes pairing without affecting existing saved connections.
 
@@ -82,10 +87,11 @@ Keep the receiver and tunnel running. If the tunnel URL changes, update the send
 ## Project Structure
 
 ```text
-app.py                Desktop interface and send workflow
+app.py                Messaging windows, separate DSA Lab, pairing
 structures.py         FIFO queue, linked list, hash table, persistence
 network.py            Encryption, authentication, client, receiver
 test_cipherchaos.py   Data structure and delivery tests
+test_gui.py           Messaging, shared state, and pairing GUI tests
 Demo.bat              Local demonstration launcher
 Sender.bat            Sender launcher
 Receiver.bat          Receiver launcher
@@ -99,6 +105,12 @@ requirements.txt      Python dependency
 ```
 
 Tests cover FIFO order, collision handling, shared node references, persistence, encryption and decryption, authentication failure, tampering rejection, idempotent retries, pairing approval, expiry, rejection, attempt limits, and saved credentials after receiver restart.
+
+Run the GUI integration checks on a desktop with Tkinter:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest -v test_gui
+```
 
 ## Storage and Security
 
